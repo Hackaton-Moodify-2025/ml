@@ -1,0 +1,19 @@
+version: "3.8"
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Fast_api/Dockerfile
+    image: gpb-reviews-api:latest
+    container_name: gpb-reviews-api
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./:/app:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0) if urllib.request.urlopen('http://localhost:8000/health').status==200 else sys.exit(1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
