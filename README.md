@@ -16,11 +16,15 @@
 ``` {"predictions":[{"id":1,"topics":["Кредитная карта","Мобильное приложение"],"sentiments":["положительно","отрицательно"]}]} ```
 ## Сборка и запуск контейнера
 
-``` docker compose up -d --build ```
+```bash
+docker compose up -d --build
+```
 
 ## HealthCheck
 
-``` curl http://localhost:8000/health  ```
+```bash 
+curl http://localhost:8000/health
+```
 
 ## Проверка работоспособности FASTAPI
 
