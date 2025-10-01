@@ -1,0 +1,32 @@
+# базовый стек
+numpy
+pandas
+scikit-learn
+scipy
+
+# эмбеддинги и трансформеры
+sentence-transformers
+transformers
+
+# torch (CPU; для macOS ARM ставится из PyPI автоматически)
+torch
+
+# тематическая модель
+bertopic==0.17.3
+hdbscan
+
+# NLP-утилиты
+nltk
+pymorphy2
+pymorphy2-dicts-ru
+
+# утилиты/логирование/эксель
+joblib
+openpyxl
+mlflow
+
+
+fastapi
+uvicorn[standard]
+pydantic>=2
+requests
