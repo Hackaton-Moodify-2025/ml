@@ -3,67 +3,75 @@ import os
 import json
 import re
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple, Dict
+from src.encode import encode_long
 
 import numpy as np
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 
-# Импортируем свои утилиты
-from src.encode import encode_long
-from src.sentiment import predict_sentiment  # внутри должен быть truncation=True, max_length=512
+from huggingface_hub import snapshot_download
+from transformers import pipeline
+import torch
 
-# ==== Конфиг (жёсткие дефолты) ====
+# ==== Конфиг ====
 MODEL_DIR = Path(os.getenv("MODEL_DIR", "artifacts/latest"))
 POOLING = os.getenv("POOLING", "max")
 MAX_CHARS = int(os.getenv("MAX_CHARS", "1000"))
 TOPK = int(os.getenv("TOPK", "5"))
+
+# Батчи
+EMB_BATCH = int(os.getenv("EMB_BATCH", "32"))
 SENTIMENT_MODEL = os.getenv("SENTIMENT_MODEL", "blanchefort/rubert-base-cased-sentiment")
-SENTIMENT_BATCH = int(os.getenv("SENTIMENT_BATCH", "32"))
+SENTIMENT_BATCH = int(os.getenv("SENTIMENT_BATCH", "64"))
+SENT_MAX_LEN = int(os.getenv("SENT_MAX_LEN", "256"))
+
+# HF repo с эмбеддером
+HF_REPO = os.getenv("HF_REPO", "moomive/my-banking-embedder")
+HF_TOKEN = os.getenv("HF_TOKEN")  # нужен, если репо приватный
 
 # Порог уверенности и «умный» фильтр для категорий
-MIN_CONF  = 0.15   # строгий порог показа
-MIN_FLOOR = 0.10   # нижний порог, если есть хороший зазор
-MARGIN    = 0.05   # зазор с соседней категорией
-TAU       = 0.03   # температура softmax
+MIN_CONF  = float(os.getenv("MIN_CONF",  "0.10"))  # строгий порог показа
+MIN_FLOOR = float(os.getenv("MIN_FLOOR", "0.08"))  # нижний порог, если есть хороший зазор
+MARGIN    = float(os.getenv("MARGIN",    "0.03"))  # зазор с соседней категорией
+TAU       = float(os.getenv("TAU",       "0.05"))  # температура softmax
 
-# Настройки аспектного сентимента (назначение предложений категориям)
-SENT_MIN_SIM   = 0.12  # минимальная схожесть предложения с категорией, чтобы «привязать» его к ней
-SENT_MAX_CHARS = 400
-# лёгкий бонус к похожести, если в клаузе встречается якорное слово для категории
-KEYWORD_BONUS  = 0.10
+# Настройки аспектного сентимента
+SENT_MIN_SIM        = float(os.getenv("SENT_MIN_SIM",       "0.10"))
+SENT_MULTI_DELTA    = float(os.getenv("SENT_MULTI_DELTA",   "0.03"))
+SENT_BACKFILL_TOPN  = int(os.getenv("SENT_BACKFILL_TOPN",   "1"))
+SENT_MAX_CHARS      = int(os.getenv("SENT_MAX_CHARS",       "300"))
+KEYWORD_BONUS       = float(os.getenv("KEYWORD_BONUS",      "0.10"))
 
 # ==== Pydantic модели ====
-
 class ReviewIn(BaseModel):
     id: str | int
-    text: str = Field(min_length=1)
+    text: Optional[str] = ""  # допускаем null -> ""
 
 class ReviewsIn(BaseModel):
     data: List[ReviewIn]
 
 class ReviewOut(BaseModel):
     id: str | int
-    topics: List[Optional[str]]        # длиной TOPK, порядок cat1..catK
-    sentiments: List[Optional[str]]        # длиной TOPK, порядок sent1..sentK, выровнен с categories
-   
+    topics: List[str]      # без null, только выбранные категории
+    sentiments: List[str]  # без null, та же длина, что и topics
 
 class ReviewsOut(BaseModel):
     predict: List[ReviewOut]
 
 # ==== Приложение ====
-app = FastAPI(title="Banking Topics Inference API", version="1.2")
+app = FastAPI(title="Banking Topics Inference API", version="1.3-fast")
 
-# Глобальные объекты (грузим при старте)
+# Глобальные объекты
 EMBEDDER: Optional[SentenceTransformer] = None
-CLASS_VECS: Optional[np.ndarray] = None  # [num_classes, dim]
-CLASS_NAMES: Optional[list[str]] = None
+CLASS_VECS: Optional[np.ndarray] = None
+CLASS_NAMES: Optional[List[str]] = None
+SENT_CLF = None  # глобальный sentiment pipeline
 
 # ==== Хелперы ====
-
-def _load_artifacts(model_dir: Path):
+def _load_artifacts(model_dir: Path) -> Tuple[SentenceTransformer, np.ndarray, List[str]]:
     assert (model_dir / "class_vecs.npy").exists(), f"Missing {model_dir/'class_vecs.npy'}"
     assert (model_dir / "class_names.json").exists(), f"Missing {model_dir/'class_names.json'}"
     assert (model_dir / "embedder").exists(), f"Missing {model_dir/'embedder'} directory"
@@ -74,23 +82,22 @@ def _load_artifacts(model_dir: Path):
     embedder = SentenceTransformer(str(model_dir / "embedder"))
     return embedder, class_vecs, class_names
 
-def _build_texts(rows: List[ReviewIn]) -> list[str]:
-    return [r.text.strip() for r in rows]
+def _build_texts(rows: List[ReviewIn]) -> List[str]:
+    return [(r.text or "").strip() for r in rows]
 
 def _softmax_cos_row(x: np.ndarray, tau: float) -> np.ndarray:
-    """Softmax поверх косинусов: меньше tau → распределение острее."""
     x = np.asarray(x, dtype=np.float64)
     z = (x - x.max()) / max(tau, 1e-9)
     ez = np.exp(z)
     return ez / ez.sum()
 
-def split_into_sents(text: str) -> list[str]:
+def split_into_sents(text: str) -> List[str]:
     """Бьём на клаузы: по .?! и дополнительно по контрастивным союзам ('но', 'однако', 'а', 'зато')."""
     t = (text or "").strip()
     if not t:
         return []
     parts = re.split(r"[.!?]+[\s\n]+", t)
-    chunks: list[str] = []
+    chunks: List[str] = []
     for p in parts:
         p = p.strip()
         if not p:
@@ -102,108 +109,148 @@ def split_into_sents(text: str) -> list[str]:
                 chunks.append(s)
     return chunks
 
-def majority_label(labels: list[str], default: str = "Нейтрально") -> str:
+def majority_label(labels: List[str], default: str = "Нейтрально") -> str:
     if not labels:
         return default
     norm = []
     for l in labels:
         l = (l or "").lower()
-        if l in {"negative", "neg", "негатив", "отрицательно"}:
-            norm.append("Отрицательно")
-        elif l in {"neutral", "neu", "нейтрально"}:
-            norm.append("Нейтрально")
-        elif l in {"positive", "pos", "позитив", "положительно"}:
+        if l.startswith("pos") or l in {"положительно", "позитив"}:
             norm.append("Положительно")
+        elif l.startswith("neg") or l in {"негатив", "отрицательно"}:
+            norm.append("Отрицательно")
         else:
             norm.append("Нейтрально")
     from collections import Counter
     return Counter(norm).most_common(1)[0][0]
 
 def keyword_bonus(clause: str, cat_name: str) -> float:
-    """Небольшой бонус к похожести, если в тексте клауы и имени категории есть якорные слова."""
     if not clause or not cat_name:
         return 0.0
     c = clause.lower()
     n = cat_name.lower()
-    anchors = {
-        "прилож": ["прилож", "мобиль"],
-        "обслуж": ["обслуж", "сервис"],
-        "поддерж": ["поддерж", "саппорт", "колл-центр", "колл центр"],
-        "кэшбэк": ["кэшбэк", "cashback", "бонус"],
-        "карта": ["карта", "дебетов", "кредитн"],
-        "перевод": ["перевод", "платёж", "оплата"],
-        "вклад": ["вклад", "депозит", "накопит"],
+    patterns = {
+        r"прилож": [r"\bприлож\w*", r"\bмобиль\w*"],
+        r"обслуж|сервис": [r"\bобслуж\w*", r"\bсервис\w*"],
+        r"поддерж": [r"\bподдерж\w*", r"\bсаппорт\w*", r"колл[\-\s]?центр"],
+        r"кэшб|cashback|бонус": [r"\bкэшб\w*", r"\bcashback\b", r"\bбонус\w*"],
+        r"карт": [r"\bкарт\w*", r"\bкредит\w*", r"\bдебет\w*"],
+        r"перевод|платеж|оплат": [r"\bперевод\w*", r"\bплат[её]ж\w*", r"\bоплат\w*"],
+        r"вклад|депозит|накоп": [r"\bвклад\w*", r"\bдепозит\w*", r"\bнакоп\w*"],
+        r"union ?pay": [r"\bunion ?pay\b"],
     }
-    for key, keys in anchors.items():
-        if key in n and any(k in c for k in keys):
-            return KEYWORD_BONUS
+    for cat_pat, clause_pats in patterns.items():
+        if re.search(cat_pat, n):
+            if any(re.search(p, c) for p in clause_pats):
+                return KEYWORD_BONUS
     return 0.0
 
-# ==== События жизненного цикла ====
+def ensure_embedder(model_dir: Path):
+    emb_dir = model_dir / "embedder"
+    if emb_dir.exists() and any(emb_dir.iterdir()):
+        return
+    if not HF_REPO:
+        raise RuntimeError("HF_REPO is not set. Cannot download embedder from Hugging Face.")
+    print(f"[INFO] Downloading embedder from HF: {HF_REPO} -> {emb_dir}")
+    emb_dir.mkdir(parents=True, exist_ok=True)
+    snapshot_download(
+        repo_id=HF_REPO,
+        repo_type="model",
+        local_dir=str(emb_dir),
+        local_dir_use_symlinks=False,
+        token=HF_TOKEN,
+    )
 
+def run_sentiment(batch_texts: List[str]) -> List[str]:
+    """Глобальный быстрый сентимент (batched). Возвращает русские метки."""
+    if not batch_texts:
+        return []
+    preds = SENT_CLF(batch_texts, truncation=True, max_length=SENT_MAX_LEN, batch_size=SENTIMENT_BATCH)
+    out = []
+    for p in preds:
+        lab = (p.get("label") or "").lower()
+        if lab.startswith("pos"):
+            out.append("Положительно")
+        elif lab.startswith("neg"):
+            out.append("Отрицательно")
+        else:
+            out.append("Нейтрально")
+    return out
+
+# ==== События жизненного цикла ====
 @app.on_event("startup")
 def on_startup():
-    global EMBEDDER, CLASS_VECS, CLASS_NAMES
-    try:
-        EMBEDDER, CLASS_VECS, CLASS_NAMES = _load_artifacts(MODEL_DIR)
-    except Exception as e:
-        raise RuntimeError(f"Failed to load artifacts from {MODEL_DIR}: {e}")
+    global EMBEDDER, CLASS_VECS, CLASS_NAMES, SENT_CLF
+
+    # 1) гарантируем, что embedder есть (если нет — подтянем с HF)
+    ensure_embedder(MODEL_DIR)
+
+    # 2) загрузка артефактов
+    EMBEDDER, CLASS_VECS, CLASS_NAMES = _load_artifacts(MODEL_DIR)
+
+    # 3) инициализация sentiment-пайплайна 1 раз
+    # предпочитаем MPS на Apple, затем CUDA, иначе CPU
+    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        device = "mps"
+    else:
+        device = 0 if torch.cuda.is_available() else -1
+    global_pipe = pipeline(
+        "sentiment-analysis",
+        model=SENTIMENT_MODEL,
+        tokenizer=SENTIMENT_MODEL,
+        device=device
+    )
+    SENT_CLF = global_pipe
 
 @app.get("/health")
 def health():
-    ok = all([EMBEDDER is not None, CLASS_VECS is not None, CLASS_NAMES is not None])
+    ok = all([EMBEDDER is not None, CLASS_VECS is not None, CLASS_NAMES is not None, SENT_CLF is not None])
     return {
         "status": "ok" if ok else "broken",
         "classes": len(CLASS_NAMES) if CLASS_NAMES else 0,
+        "hf_repo": HF_REPO or None,
+        "batch": {"EMB_BATCH": EMB_BATCH, "SENTIMENT_BATCH": SENTIMENT_BATCH, "SENT_MAX_LEN": SENT_MAX_LEN},
         "thresholds": {
             "MIN_CONF": MIN_CONF, "MIN_FLOOR": MIN_FLOOR, "MARGIN": MARGIN, "TAU": TAU,
-            "SENT_MIN_SIM": SENT_MIN_SIM, "SENT_MAX_CHARS": SENT_MAX_CHARS, "KEYWORD_BONUS": KEYWORD_BONUS
+            "SENT_MIN_SIM": SENT_MIN_SIM, "SENT_MULTI_DELTA": SENT_MULTI_DELTA,
+            "SENT_BACKFILL_TOPN": SENT_BACKFILL_TOPN, "SENT_MAX_CHARS": SENT_MAX_CHARS,
+            "KEYWORD_BONUS": KEYWORD_BONUS
         },
     }
 
 # ==== Основной эндпоинт ====
-
 @app.post("/predict", response_model=ReviewsOut)
 def predict(body: ReviewsIn):
-    if EMBEDDER is None or CLASS_VECS is None or CLASS_NAMES is None:
+    if EMBEDDER is None or CLASS_VECS is None or CLASS_NAMES is None or SENT_CLF is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
-
     if not body.data:
-        return ReviewsOut(data=[])
+        return ReviewsOut(predict=[])
 
     # 1) Тексты
     texts = _build_texts(body.data)
 
     # 2) Эмбеддинги (целиком)
     try:
-        embs = encode_long(texts, EMBEDDER, pooling=POOLING, max_chars=MAX_CHARS)
+        embs = encode_long(texts, EMBEDDER, pooling=POOLING, max_chars=MAX_CHARS, batch_size=EMB_BATCH)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Embedding failed: {e}")
 
     # 3) Косинусы + вероятности
-    sims = cosine_similarity(embs, CLASS_VECS)      # [N, C]
-    order = np.argsort(sims, axis=1)[:, ::-1]       # индексы по убыванию
+    sims = cosine_similarity(embs, CLASS_VECS)   # [N, C]
+    order = np.argsort(sims, axis=1)[:, ::-1]
 
-    # 4) Общий сентимент
-    try:
-        sentiments = predict_sentiment(texts, model_name=SENTIMENT_MODEL, batch_size=SENTIMENT_BATCH)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Sentiment failed: {e}")
-
-    # 5) Ответ
+    # 4) Ответ
     out_rows: List[ReviewOut] = []
     for i, rev in enumerate(body.data):
         probs_i = _softmax_cos_row(sims[i], tau=TAU)
         top_idx = order[i, :TOPK]
 
-        names: List[Optional[str]] = []
-        probs: List[Optional[float]] = []
-
-        # применяем умный фильтр (последняя позиция — только MIN_CONF)
+        # === Выбираем категории (умный фильтр) ===
+        chosen_real_idx: List[int] = []
+        chosen_names: List[str] = []
         k_last = len(top_idx) - 1
         for j, idx in enumerate(top_idx):
             p = float(probs_i[idx])
-
             if j == k_last:
                 cond = p >= MIN_CONF
             else:
@@ -211,61 +258,82 @@ def predict(body: ReviewsIn):
                 cond_conf   = p >= MIN_CONF
                 cond_margin = (p >= MIN_FLOOR) and ((p - next_p) >= MARGIN)
                 cond = cond_conf or cond_margin
+            if cond:
+                chosen_real_idx.append(idx)
+                chosen_names.append(CLASS_NAMES[idx])
 
-            names.append(CLASS_NAMES[idx] if cond else None)
-            probs.append(p)
+        # Если ни одна не прошла — пустые массивы
+        if not chosen_real_idx:
+            
+            best_idx = int(order[i, 0])
+            topics = [CLASS_NAMES[best_idx]]
 
-        # Дополняем до 5 слотов
-        while len(names) < 5:
-            names.append(None)
-            probs.append(None)
+            # аспектный сентимент: весь текст как одна клауза
+            sents = split_into_sents(texts[i]) or [texts[i]]
+            # можно сократить до 1-2 клауз, если длинно:
+            sents = sents[:1]
+            seg_lab = run_sentiment(sents)
+            aspects_sent = [majority_label(seg_lab, default="Нейтрально")]
 
-        # ===== АСПЕКТНЫЙ СЕНТИМЕНТ =====
+            out_rows.append(ReviewOut(id=rev.id, topics=topics, sentiments=aspects_sent))
+            continue
+            
+
+        topics = chosen_names[:]  # без null
+
+        # === Аспектный сентимент по выбранным категориям ===
         sents = split_into_sents(texts[i])
-        cat_sent_labels = [None, None, None, None, None]
+        if not sents:
+            aspects_sent = ["Нейтрально"] * len(topics)
+        else:
+            # эмбеддинги клауз
+            sent_embs = encode_long(sents, EMBEDDER, pooling=POOLING, max_chars=SENT_MAX_CHARS, batch_size=EMB_BATCH)
 
-        if sents:
-            # эмбеддинги предложений (короткие куски)
-            sent_embs = encode_long(sents, EMBEDDER, pooling=POOLING, max_chars=SENT_MAX_CHARS)
+            sub_class_vecs = CLASS_VECS[chosen_real_idx]               # [K_sel, dim]
+            sent_sims = cosine_similarity(sent_embs, sub_class_vecs)   # [S, K_sel]
 
-            # локальные индексы выбранных категорий
-            chosen_loc_idx  = [k for k, nm in enumerate(names) if nm]
-            chosen_real_idx = [top_idx[k] for k in chosen_loc_idx]
+            # keyword bonus
+            for si, clause in enumerate(sents):
+                for cj, cat_name in enumerate(topics):
+                    if cat_name:
+                        sent_sims[si, cj] += keyword_bonus(clause, cat_name)
 
-            if chosen_real_idx:
-                sub_class_vecs = CLASS_VECS[chosen_real_idx]                 # [K_sel, dim]
-                sent_sims = cosine_similarity(sent_embs, sub_class_vecs)     # [S, K_sel]
+            # мультиназначение с порогами
+            from collections import defaultdict
+            bucket: Dict[int, List[int]] = defaultdict(list)
+            row_max = sent_sims.max(axis=1, keepdims=True)
+            mask = (sent_sims >= (row_max - SENT_MULTI_DELTA)) & (sent_sims >= SENT_MIN_SIM)
 
-                # keyword bonus
-                for si, clause in enumerate(sents):
-                    for cj, loc_k in enumerate(chosen_loc_idx):
-                        cat_name = names[loc_k]
-                        if cat_name:
-                            sent_sims[si, cj] += keyword_bonus(clause, cat_name)
+            for si in range(sent_sims.shape[0]):
+                cands = np.where(mask[si])[0].tolist()
+                for cj in cands:
+                    bucket[cj].append(si)
 
-                best_idx = np.argmax(sent_sims, axis=1)                      # для каждого предложения — лучшая категория
-                best_val = np.take_along_axis(sent_sims, best_idx[:, None], axis=1).ravel()
+            # бэкфилл: гарантируем хотя бы одну клаузу на категорию
+            if SENT_BACKFILL_TOPN > 0:
+                for cj in range(len(topics)):
+                    if not bucket[cj]:
+                        best_si = int(np.argmax(sent_sims[:, cj]))
+                        bucket[cj].append(best_si)
 
-                # bucket: локальный индекс категории -> список предложений
-                from collections import defaultdict
-                bucket: dict[int, List[int]] = defaultdict(list)
-                for si, (bj, val) in enumerate(zip(best_idx, best_val)):
-                    if float(val) >= SENT_MIN_SIM:
-                        loc_k = chosen_loc_idx[bj]  # маппим обратно к 0..4
-                        bucket[loc_k].append(si)
+            # единый батч сентимента по всем сегментам
+            all_seg_items: List[Tuple[int, str]] = []
+            for cj in range(len(topics)):
+                for si in bucket.get(cj, []):
+                    all_seg_items.append((cj, sents[si]))
 
-                # сентимент по каждому «ведру»
-                for loc_k, sent_ids in bucket.items():
-                    seg_texts = [sents[x] for x in sent_ids]
-                    seg_labels = predict_sentiment(seg_texts, model_name=SENTIMENT_MODEL, batch_size=SENTIMENT_BATCH)
-                    cat_sent_labels[loc_k] = majority_label(seg_labels, default="Нейтрально")
+            if all_seg_items:
+                seg_labels = run_sentiment([t for _, t in all_seg_items])
+                per_cat: Dict[int, List[str]] = {}
+                for (cj, _), lab in zip(all_seg_items, seg_labels):
+                    per_cat.setdefault(cj, []).append(lab)
+                aspects_sent = [
+                    majority_label(per_cat.get(cj, []), default="Нейтрально")
+                    for cj in range(len(topics))
+                ]
+            else:
+                aspects_sent = ["Нейтрально"] * len(topics)
 
-        out_rows.append(ReviewOut(
-            id=rev.id,
-            text=rev.text,
-            topics=names[:TOPK],
-            sentiments=cat_sent_labels[:TOPK],
-            sentiment=sentiments[i],
-        ))
+        out_rows.append(ReviewOut(id=rev.id, topics=topics, sentiments=aspects_sent))
 
     return ReviewsOut(predict=out_rows)
