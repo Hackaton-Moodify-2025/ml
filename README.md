@@ -7,7 +7,7 @@
 - Определение тональности (положительно / нейтрально / отрицательно).
 
 ## API
-- `POST /analyze`
+- `POST /predict`
   ```json
   {"data":[{"id":1,"text":"Карта понравилась, но приложение лагает"}]}
   ```
@@ -20,12 +20,14 @@
 docker compose up -d --build
 ```
 
-## HealthCheck
+**ML/NLP стек:**
+- NumPy, Pandas, SciPy — обработка данных
+- scikit-learn — классические ML-алгоритмы
+- PyTorch — обучение и инференс моделей
+- BERTopic + HDBSCAN — тематическое моделирование
+- NLTK, pymorphy2 — NLP-утилиты для русского языка
 
-```bash 
-curl http://localhost:8000/health
-```
-
-## Проверка работоспособности FASTAPI
-
-``` curl -X POST "http://localhost:8000/analyze" -H "Content-Type: application/json" -d '{"data":[{"id":1,"text":"Очень понравилось обслуживание в отделении, но мобильное приложение часто зависает."},{"id":2,"text":"Кредитную карту одобрили быстро, но лимит слишком маленький."}]}' ```
+**Сервисный стек:**
+- FastAPI + Uvicorn — REST API
+- Pydantic — валидация и схемы данных
+- MLflow — управление экспериментами и моделями
